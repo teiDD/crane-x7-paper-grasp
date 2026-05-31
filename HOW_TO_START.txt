@@ -1,0 +1,39 @@
+===================================================
+  ソフトロボットハンド RL — 起動ガイド
+===================================================
+
+【1. インストール】
+    pip install -r requirements.txt
+
+【2. 環境テスト（まずここから）】
+    python env.py
+    → 20ステップだけランダム行動で動いて obs/reward を表示
+
+【3. 学習開始】
+    python train.py                        # マルチモーダル（本命）
+    python train.py --mode camera          # カメラのみ（比較実験）
+    python train.py --mode sensor          # センサーのみ（比較実験）
+    python train.py --exp my_run --seed 1  # 実験名・シード指定
+
+【4. ログ確認（TensorBoard）】
+    tensorboard --logdir logs/
+    → ブラウザで http://localhost:6006 を開く
+
+【5. 調整したいとき】
+    config.py  ← 数値を変えるだけで全部反映
+    reward.py  ← 報酬式を変えたいとき
+    networks.py ← ネットワーク構造を変えたいとき
+    env.py      ← フェーズ遷移・フェーズマスクを変えたいとき
+
+【6. ファイル構成】
+    config.py      全ハイパーパラメータ（ここだけ触ればOK）
+    reward.py      フェーズ別報酬関数
+    networks.py    CNN・センサーMLP・SAC Actor/Critic
+    env.py         Gym環境本体（シミュレーター）
+    train.py       SACの学習ループ
+
+【7. 実機に移行するとき】
+    config.py の BACKEND = "real" に変更
+    env.py の SimCamera / SimSensors / SimArm を
+    実際の xArm SDK / OpenCV / センサーライブラリに差し替える
+===================================================

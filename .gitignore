@@ -1,0 +1,29 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+
+# 学習成果物（巨大なのでコミット禁止）
+logs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+runs/
+wandb/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 環境
+.env
+.venv/
+venv/
