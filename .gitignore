@@ -27,3 +27,6 @@ Thumbs.db
 .env
 .venv/
 venv/
+
+# Claude Code 用ルール (個人設定なので非公開)
+CLAUDE.md
