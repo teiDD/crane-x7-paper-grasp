@@ -1,13 +1,19 @@
 ===================================================
-  ソフトロボットハンド RL — 起動ガイド
+  ソフトロボットハンド × CRANE-X7  RL — 起動ガイド
 ===================================================
 
 【1. インストール】
     pip install -r requirements.txt
+    pip install tensorboard           # ログ可視化用（任意）
 
 【2. 環境テスト（まずここから）】
     python env.py
     → 20ステップだけランダム行動で動いて obs/reward を表示
+    エラー無く動けば各モジュール (sim_backend / reward / encoders) が
+    正しく繋がっている合図
+
+    python _test_gnn.py
+    → GNN エンコーダー + ネットワーク全体の forward 通り確認
 
 【3. 学習開始】
     python train.py                        # マルチモーダル（本命）
@@ -19,21 +25,71 @@
     tensorboard --logdir logs/
     → ブラウザで http://localhost:6006 を開く
 
-【5. 調整したいとき】
-    config.py  ← 数値を変えるだけで全部反映
-    reward.py  ← 報酬式を変えたいとき
-    networks.py ← ネットワーク構造を変えたいとき
-    env.py      ← フェーズ遷移・フェーズマスクを変えたいとき
+    主要メトリクス:
+      train/episode_reward        各エピソード総報酬
+      train/phase_reached         到達フェーズ (1〜3)
+      eval/success_rate           評価時の成功率
+      loss/critic / loss/actor    SAC 学習損失
+      reward/singularity          特異点近傍警告（負なら要注意）
+
+【5. 調整したいとき — どのファイルを触る？】
+    config.py       全ハイパーパラメータ（ここだけ触れば実験切替可）
+    reward.py       報酬式を変えたいとき（フェーズ別）
+    sim_backend.py  シミュレーターの挙動を変えたいとき
+                    （センサー特性・IK・カメラ）
+    env.py          フェーズ遷移・cooldown ロジック等
+    encoders.py     特徴抽出ネットワーク（CNN/MLP/GNN）構造
+    networks.py     SAC Actor/Critic の構造
+    train.py        学習ループ・ReplayBuffer
 
 【6. ファイル構成】
-    config.py      全ハイパーパラメータ（ここだけ触ればOK）
-    reward.py      フェーズ別報酬関数
-    networks.py    CNN・センサーMLP・SAC Actor/Critic
-    env.py         Gym環境本体（シミュレーター）
-    train.py       SACの学習ループ
+    config.py       全ハイパーパラメータ（4つの dataclass）
+    sim_backend.py  SimCamera / SimSensors / SimCraneX7
+                    （実機移行時に置き換える対象）
+    env.py          SoftRobotEnv（Gym 環境本体）
+    reward.py       PhaseReward（5フェーズ別報酬）
+    encoders.py     Camera / Sensor / Material / GNN / Multimodal
+    networks.py     SAC Actor / Critic / build_networks
+    train.py        ReplayBuffer / SACAgent / 学習ループ
 
-【7. 実機に移行するとき】
+【7. 実機 CRANE-X7 に移行するとき】
     config.py の BACKEND = "real" に変更
-    env.py の SimCamera / SimSensors / SimArm を
-    実際の xArm SDK / OpenCV / センサーライブラリに差し替える
+
+    sim_backend.py だけを実機ドライバに差し替えればよい:
+      SimCamera   → OpenCV / RealSense などのカメラ実装
+      SimSensors  → ADC 経由の光センサー読み取り
+      SimCraneX7  → crane_x7 ROS パッケージ / Dynamixel SDK
+
+    env.py / encoders.py / networks.py / train.py は変更不要。
+
+    ※実機では特異点ペナルティ (r_singularity) を必ず有効にし、
+      grip_rate_limit でジャーク制限がかかっていることを確認すること。
+
+【8. フェーズシステム（学習対象の流れ）】
+    Phase 1   アプローチ（紙の位置へ移動）
+       │ dist < 2cm
+       ▼
+    Phase 2a  中心合わせ + 接触確立
+       │ 全センサー > 0.10
+       ▼
+    Phase 2b  材質読み取り（最低20step、上限50step）
+       │ 安定読み取り達成
+       ▼   タイムアウト時 → -3.0 ペナルティ + cooldown ON + Phase 2a
+    Phase 2c  リフト準備確認
+       │ 把持確立
+       ▼
+    Phase 3   持ち上げ（成功 / 落下 / 部分滑り→Phase 2c）
+
+【9. Git / GitHub】
+    リポジトリ: https://github.com/teiDD/crane-x7-paper-grasp
+
+    変更したときの操作:
+        cd "C:\Users\myyam\OneDrive\Desktop\ソフトロボット\システム"
+        git status                 変更を確認
+        git add <file>             ステージ
+        git commit -m "fix: ..."   コミット
+        git push                   GitHub へ送信
+
+    .gitignore で学習成果物 (logs/, checkpoints/, *.pt) は除外済み。
+    CLAUDE.md も追跡対象外。
 ===================================================
