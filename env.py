@@ -49,6 +49,9 @@ class SoftRobotEnv(gym.Env):
         ec = self.cfg.env
         self._action_limit = np.array(ec.action_limit, dtype=np.float32)
         self._dt           = 1.0 / ec.control_hz
+        # 遅延注入の最大ステップ数。>0 のとき「実行待ちアクション列」を観測に含め、
+        # 遅延で隠れ状態になる保留指令を露わにして MDP（Markov性）を保つ。
+        self._max_latency  = int(max(ec.sim_latency_steps))
 
         # ── 観測・行動空間の定義 ──────────
         img_space = spaces.Box(
@@ -71,15 +74,26 @@ class SoftRobotEnv(gym.Env):
                                        dtype=np.float32)  # one-hot [P1,2a,2b,2c,P3]
             joint_vel_space = spaces.Box(-1.0, 1.0, shape=(ec.n_joints,),
                                           dtype=np.float32)
-            self.observation_space = spaces.Dict({
-                "image":       img_space,
-                "sensors":     sen_space,
-                "sensor_hist": spaces.Box(0.0, 1.0, shape=(hist_flat_dim,),
-                                          dtype=np.float32),
-                "joints":      joint_space,
-                "joint_vel":   joint_vel_space,
-                "phase_id":    phase_space,
-            })
+            # サブフェーズ遷移カウンタの進捗 [read, ready, lift_hold] を [0,1] で観測。
+            # 遷移を決める隠れ状態を明示し、部分観測（POMDP）化を防ぐ。
+            progress_space = spaces.Box(0.0, 1.0, shape=(3,), dtype=np.float32)
+            obs_dict = {
+                "image":         img_space,
+                "sensors":       sen_space,
+                "sensor_hist":   spaces.Box(0.0, 1.0, shape=(hist_flat_dim,),
+                                            dtype=np.float32),
+                "joints":        joint_space,
+                "joint_vel":     joint_vel_space,
+                "phase_id":      phase_space,
+                "phase_progress": progress_space,
+            }
+            # 遅延ON時のみ「実行待ちアクション列」(max_latency × action_dim) を追加。
+            # 遅延=0（既定）では付与せず観測は従来どおり（後方互換）。
+            if self._max_latency > 0:
+                obs_dict["action_queue"] = spaces.Box(
+                    -1.0, 1.0, shape=(self._max_latency * ec.action_dim,),
+                    dtype=np.float32)
+            self.observation_space = spaces.Dict(obs_dict)
         self.action_space = act_space
 
         # ── ハードウェア初期化 ────────────
@@ -108,9 +122,16 @@ class SoftRobotEnv(gym.Env):
         # ── Grip ローパスフィルタ（実機モーター保護: ジャーク制限） ──
         self._grip_state = 0.0   # 実際にモーターへ送られる grip 値（rate-limited）
 
+        # ── 並進指令ローパス + 実機遅延模擬 ──
+        self._vel_state = np.zeros(3, dtype=np.float32)  # dx,dy,dz の EMA 状態
+        self._latency   = 0                               # 適用遅延ステップ数（reset で DR）
+        self._cmd_queue = None                            # 遅延コマンドキュー（deque or None）
+        self._action_queue = None                         # 観測用: 実行待ち raw アクション列
+
         # ── ログ ──────────────────────────
         self._episode_reward = 0.0
         self._reward_log: list[RewardInfo] = []
+        self._is_success     = False   # 真の持ち上げ成功フラグ（評価の成功率に使用）
 
     def _init_backend(self):
         """シミュレーター or 実機の初期化"""
@@ -135,8 +156,10 @@ class SoftRobotEnv(gym.Env):
         super().reset(seed=seed)
 
         # 紙の位置をランダム化（Domain Randomization）
+        # gym の self.np_random を使い、reset(seed=...) で再現性を担保する
+        # （グローバル np.random だと seed 固定しても紙配置が再現しない）。
         noise = self.cfg.env.paper_pos_noise
-        paper_xy = np.random.uniform(-noise, noise, 2)
+        paper_xy = self.np_random.uniform(-noise, noise, 2)
         self._paper_pos = np.array([paper_xy[0], paper_xy[1], 0.01])  # z=1cm
 
         if self.cfg.backend == "sim":
@@ -146,6 +169,8 @@ class SoftRobotEnv(gym.Env):
             self._sensors.reset(
                 alpha_range=self.cfg.env.sensor_hysteresis_alpha,
                 drift_std=self.cfg.env.sensor_drift_std,
+                creep_rate_range=self.cfg.env.sensor_creep_rate,
+                creep_gain=self.cfg.env.sensor_creep_gain,
             )
 
         self._phase        = 1
@@ -155,6 +180,7 @@ class SoftRobotEnv(gym.Env):
         self._episode_reward = 0.0
         self._reward_log.clear()
         self._reward_fn.reset()
+        self._is_success = False
 
         self._sensor_history.clear()
         self._phase2_sub      = 0
@@ -163,6 +189,23 @@ class SoftRobotEnv(gym.Env):
         self._joints_prev     = np.zeros(self.cfg.env.n_joints, dtype=np.float32)
         self._joint_vel_norm  = np.zeros(self.cfg.env.n_joints, dtype=np.float32)
         self._grip_state      = 0.0
+
+        # 並進ローパス状態と、実機遅延 latency をエピソードごとに DR
+        self._vel_state = np.zeros(3, dtype=np.float32)
+        if self.cfg.backend == "sim":
+            lo, hi = self.cfg.env.sim_latency_steps
+            self._latency = int(self.np_random.integers(lo, hi + 1)) if hi > 0 else 0
+        else:
+            self._latency = 0
+        self._cmd_queue = (deque([(0.0, 0.0, 0.0, 0.0)] * self._latency, maxlen=self._latency)
+                           if self._latency > 0 else None)
+        # 観測用アクション窓は max_latency 固定（遅延が DR で変動しても obs 形状は不変）
+        if self._max_latency > 0:
+            self._action_queue = deque(
+                [np.zeros(self.cfg.env.action_dim, dtype=np.float32)] * self._max_latency,
+                maxlen=self._max_latency)
+        else:
+            self._action_queue = None
 
         obs  = self._get_obs()
         info = {"phase": 1}
@@ -180,8 +223,27 @@ class SoftRobotEnv(gym.Env):
 
         # ── アクションをスケール ──────────
         a = action * self._action_limit
-        dx, dy, dz, grip = float(a[0]), float(a[1]), float(a[2]), float(a[3])
-        grip = np.clip(grip, 0.0, 1.0)
+        dx, dy, dz = float(a[0]), float(a[1]), float(a[2])
+
+        # ── 並進指令ローパス（モーター慣性対策） ──
+        # 30Hz の小刻みな dx,dy,dz をそのまま送ると CRANE-X7 の PID が追従し切れず
+        # 発振する。EMA で滑らかな速度指令に整形する（move_lowpass_beta=0 で無効）。
+        beta = ec.move_lowpass_beta
+        self._vel_state = (beta * self._vel_state
+                           + (1.0 - beta) * np.array([dx, dy, dz], dtype=np.float32))
+        dx, dy, dz = (float(self._vel_state[0]), float(self._vel_state[1]),
+                      float(self._vel_state[2]))
+
+        # ── Phase2a 降下速度リミッター（遅延オーバシュート対策） ──
+        # 接触検知が通信+モーター遅延で数 step 遅れても紙を突き抜けて机に激突
+        # しないよう、Phase2a 中は降下量(dz<0)を微速に制限する（env 側で強制）。
+        if self._phase == 2 and self._phase2_sub == 0:
+            dz = max(dz, -ec.phase2a_descend_limit)
+
+        # grip は raw action[-1,1] を [0,1] 全域へ写像する。
+        # 旧実装は action[3] をそのまま clip(0,1) していたため負側の半分
+        # （tanh 出力の約半数）が常に 0 に潰れて探索効率を損ねていた。
+        grip = float(np.clip((float(action[3]) + 1.0) * 0.5, 0.0, 1.0))
 
         # ── grip 目標値の決定 ──────────────
         # Phase1 と Phase2 cooldown 中はモーターに送る目標値を 0 にする。
@@ -202,12 +264,26 @@ class SoftRobotEnv(gym.Env):
         self._grip_state += float(delta)
         grip_applied = float(np.clip(self._grip_state, 0.0, 1.0))
 
-        # ── アーム移動 ────────────────────
-        self._arm.move_delta(dx, dy, dz)
-        self._arm.set_grip(grip_applied)
+        # ── アーム移動（実機遅延の模擬: sim専用 DR） ──
+        # _cmd_queue があるとき、latency ステップ前の指令を実際にモーターへ送る。
+        # 実機の通信ラグ+モーター応答遅れを再現し、遅延ロバストな方策を学習させる。
+        # MaterialEncoder(1D-CNN) はセンサーの位相遅れ波形からこの遅延を読み取れる。
+        if self._cmd_queue is not None:
+            dx_a, dy_a, dz_a, grip_a = self._cmd_queue[0]        # latency step 前の指令
+            self._cmd_queue.append((dx, dy, dz, grip_applied))  # 現指令を投入（最古を破棄）
+        else:
+            dx_a, dy_a, dz_a, grip_a = dx, dy, dz, grip_applied
+
+        # 観測用: 直近 max_latency 個の raw アクションを保持し、実行待ち指令を
+        # 隠れ状態のままにせず obs に露出させる（遅延MDPの状態拡張でMarkov性を回復）。
+        if self._action_queue is not None:
+            self._action_queue.append(np.asarray(action, dtype=np.float32))
+
+        self._arm.move_delta(dx_a, dy_a, dz_a)
+        self._arm.set_grip(grip_a)
 
         if self.cfg.backend == "sim":
-            self._sensors.update_from_grip(grip_applied, self._arm.pos[2], self._paper_pos[2])
+            self._sensors.update_from_grip(grip_a, self._arm.pos[2], self._paper_pos[2])
 
         # ── 関節速度計算（差分 / dt / π で正規化）─────
         joints_now = self._arm.get_joint_states()
@@ -227,14 +303,17 @@ class SoftRobotEnv(gym.Env):
         if self._phase2_cooldown and sensors_now.max() < ec.phase2_cooldown_thresh:
             self._phase2_cooldown = False
 
-        obs         = self._get_obs()
-
-        # ── 報酬計算 ──────────────────────
+        # ── 報酬計算（フェーズ遷移を含む） ──
         reward, info_r, terminated, truncated = self._compute_reward(
             sensors_now, grip_applied, dz
         )
         self._episode_reward += reward
         self._reward_log.append(info_r)
+
+        # ── 観測取得（報酬計算の後: フェーズ遷移を obs に反映） ──
+        # _compute_reward が self._phase / phase_progress を更新するため、obs を
+        # 後で取得しないと遷移ステップで phase_id / phase_progress が 1step 遅れる。
+        obs = self._get_obs()
 
         # ── 状態更新 ──────────────────────
         self._sensors_prev = sensors_now.copy()
@@ -250,6 +329,7 @@ class SoftRobotEnv(gym.Env):
             "phase2_sub":     self._phase2_sub if self._phase == 2 else 0,
             "step":           self._step_count,
             "episode_reward": self._episode_reward,
+            "is_success":     self._is_success,
             **info_to_dict(info_r),
         }
 
@@ -281,9 +361,13 @@ class SoftRobotEnv(gym.Env):
 
         elif self._phase == 2:
             # センサー時系列の安定性を計算（phase2b で使用）
+            # 粘弾性クリープ対策: 値そのものの std ではなく 1階差分(step増分)の
+            # 大きさで「整定」を判定する。クリープは値をゆっくり動かすが step増分は
+            # 指数減衰するため、差分ベースなら絶対値ドリフトに惑わされず緩和完了を
+            # 検出でき、Phase2b のタイムアウト無限ループを避けられる。
             if len(self._sensor_history) > 2:
                 hist_arr   = np.array(list(self._sensor_history))
-                sensor_std = float(hist_arr.std(axis=0).mean())
+                sensor_std = float(np.abs(np.diff(hist_arr, axis=0)).mean())
             else:
                 sensor_std = 1.0   # 履歴不足時は不安定とみなす
 
@@ -298,6 +382,7 @@ class SoftRobotEnv(gym.Env):
                     grip_torque=grip_now,
                     approach_torque=ec.phase2a_approach_torq,
                     center_thresh=ec.phase2a_center_thresh,
+                    damage_thresh=ec.damage_thresh,
                 )
                 # cooldown 中は 2b 再突入を禁止（無限ループ防止）
                 if sub_done and not self._phase2_cooldown:
@@ -312,6 +397,7 @@ class SoftRobotEnv(gym.Env):
                     dt=self._dt,
                     read_steps=ec.phase2_read_steps,
                     stable_std=ec.phase2_stable_std,
+                    damage_thresh=ec.damage_thresh,
                 )
                 self._phase2b_steps += 1
                 # sensor_history_len ステップ滞在して初めて READY へ（履歴飢餓防止）
@@ -337,6 +423,7 @@ class SoftRobotEnv(gym.Env):
                     dt=self._dt,
                     ready_steps=ec.phase2_ready_steps,
                     grip_thresh=ec.phase2_grip_thresh,
+                    damage_thresh=ec.damage_thresh,
                 )
                 if sub_done:   # Phase3 へ
                     self._phase = 3
@@ -360,6 +447,7 @@ class SoftRobotEnv(gym.Env):
             )
             if success:
                 terminated = True   # 成功終了
+                self._is_success = True
             elif ep_done:
                 terminated = True   # 失敗終了（落下）
             elif (sensors_now.min() < ec.phase3_fallback_thresh
@@ -388,8 +476,14 @@ class SoftRobotEnv(gym.Env):
     #  観測取得
     # ─────────────────────────────────────
     def _get_obs(self):
-        img     = self._cam.read()
-        img_chw = np.transpose(img, (2, 0, 1))    # (H,W,C) → (C,H,W)
+        img     = self._cam.read(self._arm.pos[:2])   # eye-in-hand: アームxyで紙を描画
+        img_chw = np.transpose(img, (2, 0, 1)).astype(np.float32)  # (H,W,C) → (C,H,W)
+        # Phase2b以降（接触後）は Eye-in-Hand が指・影でオクルージョンするため画像を
+        # ゼロマスクし、触覚主導にして視覚ノイズへの過適合（モダリティ崩壊）を防ぐ。
+        # Phase2a は紙中心への視覚センタリングに画像が要るのでマスクしない。
+        if self.cfg.env.mask_image_after_contact and (
+                (self._phase == 2 and self._phase2_sub >= 1) or self._phase == 3):
+            img_chw = np.zeros_like(img_chw)
         sensors = self._sensors.read()
 
         if self.obs_mode == "camera":
@@ -419,14 +513,23 @@ class SoftRobotEnv(gym.Env):
             ec.sensor_history_len * n_sen, dtype=np.float32)
 
         joints_norm = (self._arm.get_joint_states() / np.pi).astype(np.float32)
-        return {
-            "image":       img_chw,
-            "sensors":     sensors,
-            "sensor_hist": hist_flat,              # (hist_len * n_sen,)
-            "joints":      joints_norm,            # (n_joints,) in [-1, 1]
-            "joint_vel":   self._joint_vel_norm,   # (n_joints,) in [-1, 1]
-            "phase_id":    self._get_phase_id(),   # (n_phase_ids,) one-hot
+        read_p, ready_p, lift_p = self._reward_fn.progress(
+            ec.phase2_read_steps, ec.phase2_ready_steps, ec.lift_hold_steps)
+        phase_progress = np.array([read_p, ready_p, lift_p], dtype=np.float32)
+        obs = {
+            "image":        img_chw,
+            "sensors":      sensors,
+            "sensor_hist":  hist_flat,              # (hist_len * n_sen,)
+            "joints":       joints_norm,            # (n_joints,) in [-1, 1]
+            "joint_vel":    self._joint_vel_norm,   # (n_joints,) in [-1, 1]
+            "phase_id":     self._get_phase_id(),   # (n_phase_ids,) one-hot
+            "phase_progress": phase_progress,       # (3,) [read, ready, lift_hold]
         }
+        # 遅延ON時のみ実行待ちアクション列を付与（max_latency × action_dim）
+        if self._action_queue is not None:
+            obs["action_queue"] = np.concatenate(
+                list(self._action_queue)).astype(np.float32)
+        return obs
 
     # ─────────────────────────────────────
     #  フェーズ ID（one-hot）
@@ -448,7 +551,7 @@ class SoftRobotEnv(gym.Env):
     # ─────────────────────────────────────
     def render(self):
         if self.render_mode == "rgb_array":
-            return (self._cam.read() * 255).astype(np.uint8)
+            return (self._cam.read(self._arm.pos[:2]) * 255).astype(np.uint8)
         # "human" モードは matplotlib 等で別途実装
 
     def close(self):

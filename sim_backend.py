@@ -27,14 +27,37 @@ class SimCamera:
         self.width  = width
         # 紙のシミュレーション位置（ランダム初期化）
         self._paper_xy = np.zeros(2)
+        # eye-in-hand カメラ: アーム真下を中心に ±_fov_m [m] の範囲を写す
+        self._fov_m     = 0.3
+        self._noise_std = 0.02   # 背景テクスチャ（DR）
 
     def set_paper_pos(self, xy: np.ndarray):
         self._paper_xy = xy.copy()
 
-    def read(self) -> np.ndarray:
-        """RGB 画像を返す（H, W, C），値 [0, 1]"""
-        img = np.random.rand(self.height, self.width, 3).astype(np.float32)
-        return img
+    def read(self, arm_xy: np.ndarray) -> np.ndarray:
+        """
+        eye-in-hand カメラ画像を返す（H, W, C），値 [0, 1]。
+        紙はアーム真下を中心とした相対位置にレンダリングされる。
+        アームが紙の真上に来ると紙が画像中心に写るため、CNN は
+        視覚サーボ（紙を中心へ寄せる動き）を学習できる。
+        実機では OpenCV カメラ画像に差し替える。
+        """
+        img = np.full((self.height, self.width, 3), 0.15, dtype=np.float32)
+        img += np.random.normal(0, self._noise_std, img.shape).astype(np.float32)
+
+        rel = np.asarray(self._paper_xy, dtype=np.float32) - np.asarray(arm_xy, dtype=np.float32)
+        if float(np.linalg.norm(rel)) < self._fov_m:
+            # 相対位置 [m] → ピクセル。中心 = アーム直下、±_fov_m を画面端へ写像。
+            cx = self.width  / 2 + rel[0] / self._fov_m * (self.width  / 2)
+            cy = self.height / 2 + rel[1] / self._fov_m * (self.height / 2)
+            self._draw_blob(img, cx, cy)
+        return np.clip(img, 0.0, 1.0).astype(np.float32)
+
+    def _draw_blob(self, img: np.ndarray, cx: float, cy: float, radius: int = 8):
+        """紙を明るい円として描画（簡易レンダリング）。"""
+        ys, xs = np.ogrid[:self.height, :self.width]
+        mask = (xs - cx) ** 2 + (ys - cy) ** 2 <= radius ** 2
+        img[mask] = np.array([0.95, 0.95, 0.85], dtype=np.float32)
 
     def detect_paper(self, arm_xy: np.ndarray) -> tuple[float, bool]:
         """
@@ -82,18 +105,25 @@ class SimSensors:
         self._base     = np.zeros(n, dtype=np.float32)
         self._hyst_val = np.zeros(n, dtype=np.float32)  # ヒステリシスバッファ
         self._drift    = np.zeros(n, dtype=np.float32)  # ベースラインドリフト
+        self._creep    = np.zeros(n, dtype=np.float32)  # 粘弾性クリープ状態
         self._alpha    = 0.5                            # 応答速度（reset でランダム化）
         self._drift_std = 0.0                           # ドリフト強度
+        self._creep_rate = 0.0                          # クリープ緩和速度
+        self._creep_gain = 0.0                          # クリープ最大量
 
-    def reset(self, alpha_range: tuple = (0.3, 0.7), drift_std: float = 0.005):
+    def reset(self, alpha_range: tuple = (0.3, 0.7), drift_std: float = 0.005,
+              creep_rate_range: tuple = (0.0, 0.0), creep_gain: float = 0.0):
         """
-        エピソード開始時に呼ぶ。ヒステリシス係数とドリフト強度を
+        エピソード開始時に呼ぶ。ヒステリシス係数・ドリフト強度・クリープ速度を
         各エピソードで Domain Randomization する（Sim-to-Real ロバスト性）。
         """
         self._hyst_val[:] = 0.0
         self._drift[:]    = 0.0
+        self._creep[:]    = 0.0
         self._alpha       = float(np.random.uniform(*alpha_range))
         self._drift_std   = float(drift_std)
+        self._creep_rate  = float(np.random.uniform(*creep_rate_range))
+        self._creep_gain  = float(creep_gain)
 
     def update_from_grip(self, grip_torque: float, arm_z: float, paper_z: float):
         """
@@ -115,7 +145,15 @@ class SimSensors:
         # ベースラインドリフト（ランダムウォーク）
         self._drift   += np.random.normal(0, self._drift_std, self.n).astype(np.float32)
         self._drift    = np.clip(self._drift, -0.05, 0.05)
-        self._base     = self._hyst_val + self._drift
+        # 粘弾性クリープ: 接触中は接触圧に応じた追加変形へ指数緩和（静止後も値が
+        # ダラダラ動き続ける）。非接触では緩和して戻る。1階差分は指数減衰するため、
+        # Phase2b の整定判定（差分ベース）はこれを正しく「緩和完了」と認識できる。
+        if contact:
+            creep_goal  = base_val * self._creep_gain
+            self._creep += self._creep_rate * (creep_goal - self._creep)
+        else:
+            self._creep -= self._creep_rate * self._creep
+        self._base     = self._hyst_val + self._drift + self._creep
 
     def read(self) -> np.ndarray:
         """センサー値を返す。実機では ADC 読み取りに差し替える。"""

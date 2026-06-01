@@ -35,6 +35,10 @@ class EnvConfig:
     img_height:   int = 84
     img_width:    int = 84
     img_channels: int = 3             # RGB
+    # Eye-in-Hand はPhase2b以降（接触後）に指・影でオクルージョンするため、
+    # 画像をゼロマスクして触覚主導にし、視覚ノイズへの過適合（モダリティ崩壊）を防ぐ。
+    # Phase2a は紙中心へのXY視覚センタリングに画像が要るのでマスクしない。
+    mask_image_after_contact: bool = True
 
     # ── 光センサー ─────────────────────────
     n_sensors:     int   = 6          # センサー総数（指A×3 + 指B×3）
@@ -52,8 +56,9 @@ class EnvConfig:
     # ── 終了判定 ──────────────────────────
     lift_target_m:  float = 0.05      # 成功に必要な持ち上げ高さ [m]
     lift_hold_steps: int  = 10        # 持ち上げ維持ステップ数
-    slip_thresh:    float = 0.05      # 滑り検知閾値（センサー変化速度）
-    damage_thresh:  float = 0.50      # 破損検知閾値（急激変化）
+    slip_thresh:    float = 0.10      # 滑り検知: 1stepのセンサー最大変化量がこれ超で滑り（ノイズ床~0.04より上）
+    damage_thresh:  float = 0.30      # 破損検知: 1stepのセンサー最大変化量がこれ超で破損終了（実際の急激スラム。正常接触~0.12より上）
+    phase3_fallback_thresh: float = 0.15  # Phase3: 最小センサーがこれ未満かつ未落下(max>=0.05)なら Phase2c へ戻し把持立て直し
 
     # ── Phase 2 材質適応把持（3段階） ────────
     sensor_history_len:    int   = 20     # 材質推定用センサー履歴長 [steps]
@@ -67,10 +72,19 @@ class EnvConfig:
     # ── センサー Domain Randomization（実機ヒステリシス/ドリフト対策） ──
     sensor_hysteresis_alpha: tuple = (0.3, 0.7)  # α-混合係数の DR 範囲（小=遅い応答）
     sensor_drift_std:        float = 0.005       # ベースラインドリフトのランダムウォーク標準偏差
+    # 粘弾性クリープ: シリコン/エラストマー系ソフトセンサーは接触静止後も
+    # ゆっくり変形し続ける。指数緩和でモデル化し、整定判定は1階差分ベースにする。
+    sensor_creep_rate:       tuple = (0.01, 0.03)  # 緩和速度の DR 範囲（小=ゆっくり）
+    sensor_creep_gain:       float = 0.15          # クリープ最大量（接触圧に対する比）
 
     # ── アクション安全制御（実機ハードウェア保護） ──
     grip_rate_limit:    float = 0.15      # 1step あたりの grip 変化上限（ジャーク制限）
     singularity_warn:   float = 0.90      # |joint|/π > これでペナルティ開始（特異点近傍）
+
+    # ── 実機遅延・慣性対策（Sim-to-Real） ──
+    move_lowpass_beta:     float = 0.0    # dx,dy,dz の EMAローパス係数[0,1)。0=無効。モーター慣性で発振する実機では 0.3〜0.6 推奨（PID応答に合わせ要調整）
+    phase2a_descend_limit: float = 0.01   # Phase2a 降下dzの1stepあたり上限[m]。遅延で接触検知が遅れても机に激突しない微速降下を env 側で強制（デフォルトON）
+    sim_latency_steps:     tuple = (0, 0) # sim専用: アクション適用遅延のDR範囲[min,max]ステップ。実機の通信+モーター遅延を模擬。実機狙いの学習では (2, 3)=66〜100ms@30Hz 推奨
 
     # ── フェーズ ID ────────────────────────
     n_phase_ids:           int   = 5      # [Phase1, 2a, 2b, 2c, Phase3] の one-hot 次元数
@@ -132,7 +146,7 @@ class SACConfig:
     target_entropy: float = -4.0      # 目標エントロピー = -dim(A)
 
     # ── バッファ・バッチ ───────────────────
-    buffer_size:  int = 1_000_000
+    buffer_size:  int = 100_000       # 画像はuint8保存（train.py）。100k で約4GB。1Mにすると数十GBでOOM注意
     batch_size:   int = 256
     warmup_steps: int = 10_000        # この間はランダム行動でバッファ充填
     update_freq:  int = 4             # 何ステップごとにネットワーク更新

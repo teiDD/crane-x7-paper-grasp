@@ -30,7 +30,8 @@ class CameraEncoder(nn.Module):
     画像から紙の位置・姿勢・グリッパーとの位置関係を抽出。
     """
 
-    def __init__(self, cfg: NetworkConfig, img_channels: int = 3):
+    def __init__(self, cfg: NetworkConfig, img_channels: int = 3,
+                 img_height: int = 84, img_width: int = 84):
         super().__init__()
 
         layers = []
@@ -43,8 +44,8 @@ class CameraEncoder(nn.Module):
             in_ch = out_ch
         self.cnn = nn.Sequential(*layers)
 
-        # CNN の出力サイズを自動計算（img_height=84, img_width=84 前提）
-        self._cnn_out_dim = self._get_cnn_output_dim(img_channels, 84, 84)
+        # CNN の出力サイズを実際の画像サイズから自動計算（解像度変更に追従）
+        self._cnn_out_dim = self._get_cnn_output_dim(img_channels, img_height, img_width)
 
         self.flatten = nn.Flatten()
         self.linear  = nn.Sequential(
@@ -222,12 +223,15 @@ class MultimodalEncoder(nn.Module):
 
     def __init__(self, cfg: NetworkConfig, obs_mode: str,
                  img_channels: int = 3, n_sensors: int = 6,
-                 history_len: int = 20, n_joints: int = 7, n_phase: int = 5):
+                 history_len: int = 20, n_joints: int = 7, n_phase: int = 5,
+                 img_height: int = 84, img_width: int = 84,
+                 action_queue_len: int = 0):
         super().__init__()
         self.obs_mode = obs_mode
+        self.action_queue_len = action_queue_len   # 遅延ON時の実行待ちアクション列次元（0=無効）
 
         if obs_mode in ("camera", "multimodal"):
-            self.cam_enc = CameraEncoder(cfg, img_channels)
+            self.cam_enc = CameraEncoder(cfg, img_channels, img_height, img_width)
         if obs_mode in ("sensor", "multimodal"):
             self.sen_enc = SensorEncoder(cfg, n_sensors)
 
@@ -243,10 +247,10 @@ class MultimodalEncoder(nn.Module):
             self.latent_dim = cfg.cnn_latent_dim
         elif obs_mode == "sensor":
             self.latent_dim = cfg.sensor_latent_dim
-        else:  # multimodal: CNN + Sensor + Material + GNN + PhaseEmbed
+        else:  # multimodal: CNN + Sensor + Material + GNN + PhaseEmbed + phase_progress(3) + action_queue
             self.latent_dim = (cfg.cnn_latent_dim + cfg.sensor_latent_dim
                                + cfg.material_dim + cfg.gnn_latent_dim
-                               + cfg.phase_embed_dim)
+                               + cfg.phase_embed_dim + 3 + action_queue_len)
 
     def forward(self, obs: dict) -> torch.Tensor:
         """
@@ -269,5 +273,8 @@ class MultimodalEncoder(nn.Module):
             parts.append(self.mat_enc(obs["sensor_hist"]))
             parts.append(self.gnn_enc(obs["joints"], obs["joint_vel"]))
             parts.append(self.phase_embed(obs["phase_id"]))   # one-hot → 32次元埋め込み
+            parts.append(obs["phase_progress"])               # (B,3) 生のまま concat
+            if self.action_queue_len > 0:
+                parts.append(obs["action_queue"])             # (B, max_lat*action_dim) 実行待ち指令
 
         return torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]

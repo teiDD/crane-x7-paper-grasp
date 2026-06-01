@@ -66,6 +66,21 @@ class PhaseReward:
         """Phase3 移行時に呼ぶ（持ち上げ基準点を記録）"""
         self._z0 = z
 
+    def progress(self, read_steps: int, ready_steps: int,
+                 hold_steps: int) -> tuple[float, float, float]:
+        """
+        サブフェーズ遷移カウンタを [0,1] 正規化して返す（観測へ供給）。
+        これらは遷移条件を決める隠れ状態であり、観測に含めないと
+        環境が部分観測（POMDP）になり学習を不安定化させる。
+
+        Returns: (read進捗 Phase2b, ready進捗 Phase2c, lift_hold進捗 Phase3)
+        """
+        return (
+            min(1.0, self._phase2_read_count  / max(1, read_steps)),
+            min(1.0, self._phase2_ready_count / max(1, ready_steps)),
+            min(1.0, self._lift_hold_count    / max(1, hold_steps)),
+        )
+
     def reset_phase2c(self):
         """Phase3→Phase2c フォールバック時に呼ぶ（再把持確認カウンターをリセット）"""
         self._phase2_ready_count = 0
@@ -130,6 +145,7 @@ class PhaseReward:
         grip_torque:     float,    # 現在のグリップトルク [0, 1]
         approach_torque: float,    # 推奨アプローチトルク
         center_thresh:   float,    # 中心合わせ許容誤差 [m]
+        damage_thresh:   float,    # 破損判定: 1stepセンサー最大変化量の上限
     ) -> tuple[float, RewardInfo, bool, bool]:
         """
         CRANE-X7 接触フェーズ:
@@ -142,7 +158,8 @@ class PhaseReward:
         """
         info = RewardInfo()
 
-        if np.abs(sensors - sensors_prev).max() / dt > 0.50:
+        # 破損検知: 1step のセンサー最大変化量で判定（旧 /dt は ×30 でノイズ誤発火）
+        if np.abs(sensors - sensors_prev).max() > damage_thresh:
             info.r_terminal = self.c.r_damage
             info.total = info.r_terminal
             return info.total, info, False, True
@@ -185,6 +202,7 @@ class PhaseReward:
         dt:          float,
         read_steps:  int,
         stable_std:  float,
+        damage_thresh: float,     # 破損判定: 1stepセンサー最大変化量の上限
     ) -> tuple[float, RewardInfo, bool, bool]:
         """
         Returns: (reward, info, sub_done, episode_done)
@@ -192,7 +210,8 @@ class PhaseReward:
         """
         info = RewardInfo()
 
-        if np.abs(sensors - sensors_prev).max() / dt > 0.50:
+        # 破損検知: 1step のセンサー最大変化量で判定（旧 /dt は ×30 でノイズ誤発火）
+        if np.abs(sensors - sensors_prev).max() > damage_thresh:
             info.r_terminal = self.c.r_damage
             info.total = info.r_terminal
             return info.total, info, False, True
@@ -238,6 +257,7 @@ class PhaseReward:
         dt:          float,
         ready_steps: int,
         grip_thresh: float,
+        damage_thresh: float,     # 破損判定: 1stepセンサー最大変化量の上限
     ) -> tuple[float, RewardInfo, bool, bool]:
         """
         Returns: (reward, info, phase_done, episode_done)
@@ -245,7 +265,8 @@ class PhaseReward:
         """
         info = RewardInfo()
 
-        if np.abs(sensors - sensors_prev).max() / dt > 0.50:
+        # 破損検知: 1step のセンサー最大変化量で判定（旧 /dt は ×30 でノイズ誤発火）
+        if np.abs(sensors - sensors_prev).max() > damage_thresh:
             info.r_terminal = self.c.r_damage
             info.total = info.r_terminal
             return info.total, info, False, True
@@ -255,9 +276,9 @@ class PhaseReward:
             info.total = info.r_terminal
             return info.total, info, False, True
 
-        # 安定グリップ確認: 全センサーが grip_thresh 以上、急変なし
+        # 安定グリップ確認: 全センサーが grip_thresh 以上、急変なし（1step変化量で判定）
         grip_ok  = bool(sensors.min() >= grip_thresh)
-        delta_ok = bool(np.abs(sensors - sensors_prev).max() / dt < 0.10)
+        delta_ok = bool(np.abs(sensors - sensors_prev).max() < 0.05)   # ノイズ床~0.04より上
 
         if grip_ok and delta_ok:
             self._phase2_ready_count += 1
@@ -309,10 +330,11 @@ class PhaseReward:
             return info.total, info, False, True
 
         # ── 滑り検知 ──────────────────────
-        # センサー値の変化速度が大きい → 滑り始めている
-        slip_rate = np.abs(sensors - sensors_prev).max() / dt
-        if slip_rate > slip_thresh:
-            info.r_slip = self.c.r_slip_scale * slip_rate
+        # 1step のセンサー最大変化量が大きい → 滑り始めている
+        # （旧 /dt は ×30 でノイズに常時誤発火していた）
+        slip_delta = np.abs(sensors - sensors_prev).max()
+        if slip_delta > slip_thresh:
+            info.r_slip = self.c.r_slip_scale * slip_delta
 
         # ── 高さ報酬 ──────────────────────
         # 紙を持ちながら上昇しているときだけ加算

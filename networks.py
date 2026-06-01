@@ -133,11 +133,15 @@ def build_networks(cfg, obs_mode: str, action_dim: int, device: str = "cpu"):
     hist_len = cfg.env.sensor_history_len
     n_joints = cfg.env.n_joints
     n_phase  = cfg.env.n_phase_ids
+    # 遅延ON時の実行待ちアクション列の次元（max_latency × action_dim）。遅延OFFで0。
+    aq_len   = int(max(cfg.env.sim_latency_steps)) * cfg.env.action_dim
 
     def _make_enc():
         return MultimodalEncoder(cfg.network, obs_mode,
                                  cfg.env.img_channels, cfg.env.n_sensors,
-                                 hist_len, n_joints, n_phase).to(device)
+                                 hist_len, n_joints, n_phase,
+                                 cfg.env.img_height, cfg.env.img_width,
+                                 aq_len).to(device)
 
     # Actor と Critic は同一エンコーダーを共有（EMA コピー遅延を排除）
     enc    = _make_enc()

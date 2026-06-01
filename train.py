@@ -48,9 +48,12 @@ class ReplayBuffer:
         self._is_dict_obs = isinstance(obs_sample, dict)
 
         if self._is_dict_obs:
-            self._img  = np.zeros((capacity, *obs_sample["image"].shape),  dtype=np.float32)
+            # 画像は uint8 で保持しメモリを 1/4 に圧縮（[0,1] float ↔ [0,255] uint8）。
+            # sample 時に float32/255 へ復元する。これがないと 84x84x3 画像 ×2 を
+            # float32 で抱えてバッファが数十GBに膨れ OOM する。
+            self._img  = np.zeros((capacity, *obs_sample["image"].shape),  dtype=np.uint8)
             self._sen  = np.zeros((capacity, *obs_sample["sensors"].shape), dtype=np.float32)
-            self._nimg = np.zeros((capacity, *obs_sample["image"].shape),  dtype=np.float32)
+            self._nimg = np.zeros((capacity, *obs_sample["image"].shape),  dtype=np.uint8)
             self._nsen = np.zeros((capacity, *obs_sample["sensors"].shape), dtype=np.float32)
             # sensor_hist / joints は multimodal モードのみ存在する
             self._has_hist   = "sensor_hist" in obs_sample
@@ -69,6 +72,14 @@ class ReplayBuffer:
             if self._has_phase:
                 self._pid  = np.zeros((capacity, *obs_sample["phase_id"].shape), dtype=np.float32)
                 self._npid = np.zeros((capacity, *obs_sample["phase_id"].shape), dtype=np.float32)
+            self._has_pprog = "phase_progress" in obs_sample
+            if self._has_pprog:
+                self._pprog  = np.zeros((capacity, *obs_sample["phase_progress"].shape), dtype=np.float32)
+                self._npprog = np.zeros((capacity, *obs_sample["phase_progress"].shape), dtype=np.float32)
+            self._has_aq = "action_queue" in obs_sample
+            if self._has_aq:
+                self._aq  = np.zeros((capacity, *obs_sample["action_queue"].shape), dtype=np.float32)
+                self._naq = np.zeros((capacity, *obs_sample["action_queue"].shape), dtype=np.float32)
         else:
             self._obs  = np.zeros((capacity, *obs_sample.shape), dtype=np.float32)
             self._nobs = np.zeros((capacity, *obs_sample.shape), dtype=np.float32)
@@ -80,9 +91,10 @@ class ReplayBuffer:
     def add(self, obs, action, reward, obs_next, done):
         i = self._ptr
         if self._is_dict_obs:
-            self._img[i]  = obs["image"]
+            # float[0,1] → uint8[0,255]。sample 側で /255 に戻す。
+            self._img[i]  = np.clip(obs["image"]      * 255.0, 0, 255).astype(np.uint8)
             self._sen[i]  = obs["sensors"]
-            self._nimg[i] = obs_next["image"]
+            self._nimg[i] = np.clip(obs_next["image"] * 255.0, 0, 255).astype(np.uint8)
             self._nsen[i] = obs_next["sensors"]
             if self._has_hist:
                 self._hist[i]  = obs["sensor_hist"]
@@ -96,6 +108,12 @@ class ReplayBuffer:
             if self._has_phase:
                 self._pid[i]   = obs["phase_id"]
                 self._npid[i]  = obs_next["phase_id"]
+            if self._has_pprog:
+                self._pprog[i]  = obs["phase_progress"]
+                self._npprog[i] = obs_next["phase_progress"]
+            if self._has_aq:
+                self._aq[i]  = obs["action_queue"]
+                self._naq[i] = obs_next["action_queue"]
         else:
             self._obs[i]  = obs
             self._nobs[i] = obs_next
@@ -114,14 +132,18 @@ class ReplayBuffer:
         def t(x):
             return torch.tensor(x[idx], device=d)
 
+        def img_t(x):
+            # uint8[0,255] → float32[0,1] に復元してから転送
+            return torch.tensor(x[idx], device=d, dtype=torch.float32) / 255.0
+
         batch = {
             "action":  t(self._act),
             "reward":  t(self._rew),
             "done":    t(self._done),
         }
         if self._is_dict_obs:
-            batch["obs"]      = {"image": t(self._img),  "sensors": t(self._sen)}
-            batch["obs_next"] = {"image": t(self._nimg), "sensors": t(self._nsen)}
+            batch["obs"]      = {"image": img_t(self._img),  "sensors": t(self._sen)}
+            batch["obs_next"] = {"image": img_t(self._nimg), "sensors": t(self._nsen)}
             if self._has_hist:
                 batch["obs"]["sensor_hist"]      = t(self._hist)
                 batch["obs_next"]["sensor_hist"] = t(self._nhist)
@@ -134,6 +156,12 @@ class ReplayBuffer:
             if self._has_phase:
                 batch["obs"]["phase_id"]         = t(self._pid)
                 batch["obs_next"]["phase_id"]    = t(self._npid)
+            if self._has_pprog:
+                batch["obs"]["phase_progress"]      = t(self._pprog)
+                batch["obs_next"]["phase_progress"] = t(self._npprog)
+            if self._has_aq:
+                batch["obs"]["action_queue"]      = t(self._aq)
+                batch["obs_next"]["action_queue"] = t(self._naq)
         else:
             batch["obs"]      = t(self._obs)
             batch["obs_next"] = t(self._nobs)
@@ -277,6 +305,12 @@ class SACAgent:
             if "phase_id" in obs:
                 t_obs["phase_id"] = torch.tensor(obs["phase_id"],
                                                   device=self.device).unsqueeze(0)
+            if "phase_progress" in obs:
+                t_obs["phase_progress"] = torch.tensor(obs["phase_progress"],
+                                                       device=self.device).unsqueeze(0)
+            if "action_queue" in obs:
+                t_obs["action_queue"] = torch.tensor(obs["action_queue"],
+                                                     device=self.device).unsqueeze(0)
             return t_obs
         return torch.tensor(obs, device=self.device).unsqueeze(0)
 
@@ -298,6 +332,7 @@ def evaluate(agent: SACAgent, env: SoftRobotEnv, n_episodes: int) -> dict:
         done   = False
         ep_r   = 0.0
         max_ph = 1
+        succeeded = False
 
         while not done:
             action          = agent.select_action(obs, deterministic=True)
@@ -305,10 +340,11 @@ def evaluate(agent: SACAgent, env: SoftRobotEnv, n_episodes: int) -> dict:
             ep_r  += r
             done   = term or trunc
             max_ph = max(max_ph, info["phase"])
+            succeeded = succeeded or bool(info.get("is_success", False))
 
         total_r    += ep_r
         phase_hist.append(max_ph)
-        if max_ph == 3 and ep_r > 0:   # Phase3 に到達して正の報酬 → 成功
+        if succeeded:   # 実際に持ち上げ成功した終端のみ成功（累積報酬の符号では判定しない）
             successes += 1
 
     return {
@@ -356,7 +392,7 @@ def train(cfg):
     )
 
     # ── 学習ループ ─────────────────────────
-    obs, _          = env.reset()
+    obs, _          = env.reset(seed=cfg.seed)   # env.np_random を seed 固定（再現性）
     ep_reward       = 0.0
     ep_steps        = 0
     ep_count        = 0
@@ -379,7 +415,10 @@ def train(cfg):
         obs_next, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 
-        buffer.add(obs, action, reward, obs_next, done)
+        # ブートストラップ用マスクは「真の終端」terminated のみ。
+        # タイムアウト(truncated)で打ち切った遷移は本来エピソードが続くため、
+        # done に含めると target_q の (1-done) で価値を過小評価する（SAC の定番バグ）。
+        buffer.add(obs, action, reward, obs_next, terminated)
         obs        = obs_next
         ep_reward += reward
         ep_steps  += 1
